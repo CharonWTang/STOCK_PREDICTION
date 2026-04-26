@@ -2,6 +2,8 @@
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from itertools import combinations
 
 
 def _parabolic_sar(high: pd.Series, low: pd.Series, af_step: float = 0.02, af_max: float = 0.2) -> pd.Series:
@@ -178,7 +180,14 @@ def add_technical_features(X_df: pd.DataFrame) -> pd.DataFrame:
         low = data["Low"].astype(float)
         open_ = data["Open"].astype(float)
 
-        data["sar"] = _parabolic_sar(high=high, low=low)
+        # Compute SAR only on rows with valid OHLC to avoid full-column NaN
+        # when a stock has a long pre-listing missing segment.
+        valid_ohlc = high.notna() & low.notna() & open_.notna() & close.notna()
+        sar = pd.Series(np.nan, index=data.index, dtype=float)
+        if valid_ohlc.any():
+            sar_valid = _parabolic_sar(high=high.loc[valid_ohlc], low=low.loc[valid_ohlc])
+            sar.loc[sar_valid.index] = sar_valid
+        data["sar"] = sar
 
         tp = (high + low + close) / 3.0
         tp_ma20 = tp.rolling(20).mean()
@@ -220,6 +229,510 @@ def add_technical_features(X_df: pd.DataFrame) -> pd.DataFrame:
 
     data = data.replace([np.inf, -np.inf], np.nan)
     return data
+
+
+def add_rolling_alpha_beta_from_ret1d(
+    stock_features_df: pd.DataFrame,
+    market_data: pd.DataFrame | str | Path,
+    rolling_window: int = 252,
+) -> pd.DataFrame:
+    """Append rolling alpha/beta features using existing ret_1d from technical-feature outputs.
+
+    This function is designed to be called after ``add_technical_features`` so the
+    stock return series comes directly from ``ret_1d`` instead of recomputing pct_change.
+    """
+    if rolling_window < 2:
+        raise ValueError("rolling_window must be >= 2")
+
+    stock = stock_features_df.sort_index().copy()
+    if "ret_1d" not in stock.columns:
+        raise ValueError("stock_features_df must contain 'ret_1d'. Run add_technical_features first.")
+
+    if isinstance(market_data, (str, Path)):
+        market_raw = pd.read_csv(market_data)
+    elif isinstance(market_data, pd.DataFrame):
+        market_raw = market_data.copy()
+    else:
+        raise TypeError("market_data must be a pandas DataFrame, str path, or pathlib.Path")
+
+    if "Dt" in market_raw.columns:
+        market_raw["Dt"] = pd.to_datetime(market_raw["Dt"], format="%Y-%m-%d", errors="coerce")
+        market_raw = market_raw.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+    else:
+        market_raw = market_raw.sort_index().copy()
+        market_raw.index = pd.to_datetime(market_raw.index, errors="coerce")
+        market_raw = market_raw[market_raw.index.notna()]
+
+    market_features = add_technical_features(market_raw)
+    if "ret_1d" not in market_features.columns:
+        raise ValueError("market_data could not produce 'ret_1d'.")
+
+    pair_ret = pd.concat(
+        [
+            stock["ret_1d"].rename("stock_ret"),
+            market_features["ret_1d"].rename("market_ret"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+
+    rolling_cov = pair_ret["stock_ret"].rolling(rolling_window).cov(pair_ret["market_ret"])
+    rolling_var = pair_ret["market_ret"].rolling(rolling_window).var()
+    beta_raw = rolling_cov / (rolling_var + 1e-12)
+
+    mean_stock = pair_ret["stock_ret"].rolling(rolling_window).mean()
+    mean_market = pair_ret["market_ret"].rolling(rolling_window).mean()
+    alpha_raw = mean_stock - beta_raw * mean_market
+
+    beta_col = f"beta_{rolling_window}"
+    alpha_col = f"alpha_{rolling_window}"
+
+    pair_ret[beta_col] = beta_raw.shift(1)
+    pair_ret[alpha_col] = alpha_raw.shift(1)
+
+    stock = stock.join(pair_ret[[beta_col, alpha_col]], how="left")
+    stock = stock.replace([np.inf, -np.inf], np.nan)
+    return stock
+
+def build_market_features(spy_df: pd.DataFrame) -> pd.DataFrame:
+    spy = add_technical_features(spy_df).add_prefix("spy_")
+
+    keep_cols = [
+        "spy_ret_1d",
+        "spy_ret_ma_5",
+        "spy_ret_ma_20",
+        "spy_ret_ma_50",
+        "spy_volatility_20",
+        "spy_macd",
+        "spy_macd_signal",
+        "spy_macd_hist",
+        "spy_bb_width",
+        "spy_rsi_14",
+        "spy_volume_z_20",
+        "spy_ret_sign",
+        "spy_ret_streak",
+    ]
+
+    keep_cols = [c for c in keep_cols if c in spy.columns]
+    return spy[keep_cols]
+
+
+def add_more_market_feature(
+    stock_features_df: pd.DataFrame,
+    market_data: pd.DataFrame | str | Path,
+) -> pd.DataFrame:
+    """Append higher-level market features to an already-expanded stock table.
+
+    Existing columns are preserved. The helper only adds columns that are missing.
+    It is intended to be used at the end of the notebook after the core feature
+    engineering has already been done.
+    """
+
+    def _normalize_time_index(frame: pd.DataFrame) -> pd.DataFrame:
+        normalized = frame.copy()
+        if "Dt" in normalized.columns:
+            normalized["Dt"] = pd.to_datetime(normalized["Dt"], format="%Y-%m-%d", errors="coerce")
+            normalized = normalized.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+        else:
+            normalized = normalized.sort_index().copy()
+            normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+            normalized = normalized[normalized.index.notna()]
+        return normalized
+
+    def _set_if_missing(frame: pd.DataFrame, column_name: str, values) -> None:
+        if column_name not in frame.columns:
+            frame[column_name] = values
+
+    stock = stock_features_df.sort_index().copy()
+    if "ret_1d" not in stock.columns:
+        stock = add_technical_features(stock)
+
+    if isinstance(market_data, (str, Path)):
+        market_raw = pd.read_csv(market_data)
+    elif isinstance(market_data, pd.DataFrame):
+        market_raw = market_data.copy()
+    else:
+        raise TypeError("market_data must be a pandas DataFrame, str path, or pathlib.Path")
+
+    market_raw = _normalize_time_index(market_raw)
+
+    # Use the standard market feature subset as a baseline, but do not overwrite anything.
+    market_features = build_market_features(market_raw).reindex(stock.index)
+    for column_name in market_features.columns:
+        _set_if_missing(stock, column_name, market_features[column_name])
+
+    stock_close_col = "Adj Close" if "Adj Close" in stock.columns else "Close" if "Close" in stock.columns else None
+    market_close_col = "Adj Close" if "Adj Close" in market_raw.columns else "Close" if "Close" in market_raw.columns else None
+    if stock_close_col is None or market_close_col is None:
+        return stock.replace([np.inf, -np.inf], np.nan)
+
+    stock_ret = stock["ret_1d"].astype(float)
+    market_ret = add_technical_features(market_raw)["ret_1d"].astype(float).reindex(stock.index)
+    pair_ret = pd.concat(
+        [stock_ret.rename("stock_ret"), market_ret.rename("market_ret")],
+        axis=1,
+        join="inner",
+    ).dropna()
+
+    # Volatility regime.
+    _set_if_missing(stock, "spy_volatility_60", market_ret.rolling(60).std().shift(1).reindex(stock.index))
+    if "spy_volatility_20" in stock.columns and "spy_volatility_60" in stock.columns:
+        _set_if_missing(
+            stock,
+            "spy_volatility_ratio_20_60",
+            stock["spy_volatility_20"] / (stock["spy_volatility_60"] + 1e-12),
+        )
+
+    # Trend slope / acceleration.
+    if {"spy_ret_ma_5", "spy_ret_ma_20"}.issubset(stock.columns):
+        _set_if_missing(stock, "spy_trend_5_20", stock["spy_ret_ma_5"] - stock["spy_ret_ma_20"])
+    if {"spy_ret_ma_20", "spy_ret_ma_50"}.issubset(stock.columns):
+        _set_if_missing(stock, "spy_trend_20_50", stock["spy_ret_ma_20"] - stock["spy_ret_ma_50"])
+
+    # Dynamic beta / alpha.
+    for window in (20, 60, 252):
+        beta_col = f"beta_{window}"
+        alpha_col = f"alpha_{window}"
+        rolling_cov = pair_ret["stock_ret"].rolling(window).cov(pair_ret["market_ret"])
+        rolling_var = pair_ret["market_ret"].rolling(window).var()
+        beta_raw = rolling_cov / (rolling_var + 1e-12)
+        mean_stock = pair_ret["stock_ret"].rolling(window).mean()
+        mean_market = pair_ret["market_ret"].rolling(window).mean()
+        alpha_raw = mean_stock - beta_raw * mean_market
+        _set_if_missing(stock, beta_col, beta_raw.shift(1).reindex(stock.index))
+        _set_if_missing(stock, alpha_col, alpha_raw.shift(1).reindex(stock.index))
+
+    if {"beta_20", "beta_252"}.issubset(stock.columns):
+        _set_if_missing(stock, "beta_20_minus_252", stock["beta_20"] - stock["beta_252"])
+    if {"alpha_20", "alpha_60"}.issubset(stock.columns):
+        _set_if_missing(stock, "alpha_20_minus_60", stock["alpha_20"] - stock["alpha_60"])
+
+    # SPY shock flag.
+    shock_threshold = market_ret.abs().rolling(60).quantile(0.95).shift(1)
+    _set_if_missing(stock, "spy_shock_flag_q95_60", (market_ret.abs() > shock_threshold).astype(float).reindex(stock.index))
+
+    # Direction agreement and lagged correlation.
+    sign_match = (np.sign(stock_ret.fillna(0.0)) == np.sign(market_ret.fillna(0.0))).astype(float)
+    for window in (20, 60):
+        _set_if_missing(stock, f"aapl_spy_sign_agree_{window}", sign_match.rolling(window).mean().shift(1).reindex(stock.index))
+        _set_if_missing(stock, f"aapl_spy_lag_corr_{window}", stock_ret.rolling(window).corr(market_ret.shift(1)).shift(1).reindex(stock.index))
+
+    # SPY volume / price-pressure interactions.
+    if {"spy_volume_z_20", "spy_ret_sign"}.issubset(stock.columns):
+        _set_if_missing(stock, "spy_volume_pressure_20", stock["spy_volume_z_20"] * stock["spy_ret_sign"])
+    if {"spy_volume_z_20", "spy_ret_ma_20"}.issubset(stock.columns):
+        _set_if_missing(stock, "spy_volume_momentum_pressure_20", stock["spy_volume_z_20"] * stock["spy_ret_ma_20"])
+    if {"spy_bb_width", "spy_macd_hist"}.issubset(stock.columns):
+        _set_if_missing(stock, "spy_bb_macd_pressure", stock["spy_bb_width"] * stock["spy_macd_hist"])
+
+    # Relative strength factor.
+    price_pair = pd.concat(
+        [
+            stock[stock_close_col].astype(float).rename("stock_close"),
+            market_raw[market_close_col].astype(float).rename("market_close"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    price_ratio = np.log(price_pair["stock_close"] / price_pair["market_close"])
+    _set_if_missing(stock, "aapl_spy_log_price_ratio", price_ratio.reindex(stock.index))
+    _set_if_missing(stock, "aapl_spy_log_price_ratio_ma_20", price_ratio.rolling(20).mean().shift(1).reindex(stock.index))
+    _set_if_missing(stock, "aapl_spy_log_price_ratio_slope_20", (price_ratio - price_ratio.shift(20)).shift(1).reindex(stock.index))
+
+    # Simple market-state bucket.
+    if {"spy_ret_ma_20", "spy_volatility_20"}.issubset(stock.columns):
+        momentum = stock["spy_ret_ma_20"] - stock.get("spy_ret_ma_50", 0.0)
+        volatility_ref = stock["spy_volatility_20"].rolling(60).median().shift(1)
+        market_state = np.where(
+            (momentum > 0) & (stock["spy_volatility_20"] <= volatility_ref),
+            2.0,
+            np.where((momentum < 0) & (stock["spy_volatility_20"] > volatility_ref), 0.0, 1.0),
+        )
+        _set_if_missing(stock, "spy_market_state", pd.Series(market_state, index=stock.index).where(volatility_ref.notna(), 1.0))
+
+    # Keep the original cross-asset features if they were not already created.
+    _set_if_missing(stock, "aapl_excess_ret_1d", stock["ret_1d"] - stock.get("spy_ret_1d", stock["ret_1d"]))
+    if {"ret_ma_5", "spy_ret_ma_5"}.issubset(stock.columns):
+        _set_if_missing(stock, "aapl_excess_ret_ma_5", stock["ret_ma_5"] - stock["spy_ret_ma_5"])
+    if {"ret_ma_20", "spy_ret_ma_20"}.issubset(stock.columns):
+        _set_if_missing(stock, "aapl_excess_ret_ma_20", stock["ret_ma_20"] - stock["spy_ret_ma_20"])
+
+    return stock.replace([np.inf, -np.inf], np.nan)
+
+
+def add_interaction_features(
+    features_df: pd.DataFrame,
+    interaction_degree: int = 2,
+    top_k: int | None = 100,
+) -> pd.DataFrame:
+    """Append multiplicative interaction features from high-variance numeric columns.
+
+    ``top_k`` controls how many original numeric columns are used to build
+    interactions. For example, ``top_k=100`` and ``interaction_degree=2`` adds
+    4,950 pairwise product features.
+    """
+    if interaction_degree < 2:
+        raise ValueError("interaction_degree must be >= 2")
+    if top_k is not None and top_k < 2:
+        raise ValueError("top_k must be None or >= 2")
+
+    data = features_df.copy()
+    numeric_data = data.select_dtypes(include=[np.number]).astype(float)
+    if numeric_data.shape[1] < 2:
+        return data
+
+    numeric_data = numeric_data.replace([np.inf, -np.inf], np.nan)
+    usable_cols = numeric_data.columns[numeric_data.notna().any(axis=0)].tolist()
+    if len(usable_cols) < 2:
+        return data
+
+    col_std = numeric_data[usable_cols].std(axis=0, skipna=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    ranked_cols = col_std[col_std > 0.0].sort_values(ascending=False).index.tolist()
+    if len(ranked_cols) < 2:
+        return data
+
+    if top_k is not None:
+        ranked_cols = ranked_cols[: min(top_k, len(ranked_cols))]
+
+    new_blocks = []
+    existing_cols = set(data.columns)
+    selected_numeric = numeric_data[ranked_cols]
+
+    for degree in range(2, interaction_degree + 1):
+        interaction_columns = {}
+        for cols in combinations(ranked_cols, degree):
+            col_name = "__x__".join(cols)
+            if col_name in existing_cols:
+                continue
+
+            values = selected_numeric.loc[:, cols[0]]
+            for col in cols[1:]:
+                values = values * selected_numeric.loc[:, col]
+            interaction_columns[col_name] = values
+            existing_cols.add(col_name)
+
+        if interaction_columns:
+            new_blocks.append(pd.DataFrame(interaction_columns, index=data.index))
+
+    if new_blocks:
+        data = pd.concat([data, *new_blocks], axis=1)
+
+    return data.replace([np.inf, -np.inf], np.nan)
+
+
+def add_cross_asset_relation_features(expanded_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Add cross-asset relational features on top of an expanded AAPL feature table.
+
+    Expected inputs are columns from AAPL (unprefixed) plus prefixed columns from other
+    symbols generated by ``expand_with_other_stock_features``.
+    """
+    df = expanded_df.copy()
+    added_cols: list[str] = []
+
+    def _add_col(name: str, series: pd.Series) -> None:
+        if name not in df.columns:
+            df[name] = series
+            added_cols.append(name)
+
+    if "ret_1d" not in df.columns:
+        return df, added_cols
+
+    aapl_ret = df["ret_1d"].astype(float)
+
+    # 1) Breadth & dispersion among related tech leaders.
+    peer_tickers = ["MSFT", "GOOG", "NVDA", "ADBE", "CRM", "CSCO"]
+    peer_ret_cols = [f"{t}_ret_1d" for t in peer_tickers if f"{t}_ret_1d" in df.columns]
+    if peer_ret_cols:
+        peer_rets = df[peer_ret_cols].astype(float)
+        _add_col("peer_breadth_up", (peer_rets > 0).mean(axis=1))
+        _add_col("peer_dispersion", peer_rets.std(axis=1))
+
+    # 2) Relative returns: AAPL vs key assets.
+    for t in ["XLK", "MSFT", "SPY"]:
+        col = f"{t}_ret_1d"
+        if col in df.columns:
+            _add_col(f"aapl_minus_{t.lower()}_ret_1d", aapl_ret - df[col].astype(float))
+
+    # 3) Price-spread momentum (log price ratio momentum).
+    aapl_close_col = "Adj Close" if "Adj Close" in df.columns else "Close" if "Close" in df.columns else None
+    if aapl_close_col is not None:
+        aapl_close = df[aapl_close_col].astype(float)
+        for t in ["XLK", "MSFT", "SPY"]:
+            peer_close_col = f"{t}_Adj Close" if f"{t}_Adj Close" in df.columns else f"{t}_Close" if f"{t}_Close" in df.columns else None
+            if peer_close_col is None:
+                continue
+            log_ratio = np.log(aapl_close / df[peer_close_col].astype(float))
+            _add_col(f"aapl_{t.lower()}_log_price_ratio", log_ratio)
+            _add_col(f"aapl_{t.lower()}_spread_mom_5", (log_ratio - log_ratio.shift(5)).shift(1))
+            _add_col(f"aapl_{t.lower()}_spread_mom_20", (log_ratio - log_ratio.shift(20)).shift(1))
+
+    # 4) Rolling correlations (20/60): AAPL vs XLK/MSFT/SPY.
+    for t in ["XLK", "MSFT", "SPY"]:
+        col = f"{t}_ret_1d"
+        if col not in df.columns:
+            continue
+        peer_ret = df[col].astype(float)
+        _add_col(f"corr20_aapl_{t.lower()}", aapl_ret.rolling(20).corr(peer_ret).shift(1))
+        _add_col(f"corr60_aapl_{t.lower()}", aapl_ret.rolling(60).corr(peer_ret).shift(1))
+
+    # 5) Sector relative strength and rotation speed vs SPY.
+    if "SPY_ret_1d" in df.columns:
+        spy_ret = df["SPY_ret_1d"].astype(float)
+        for t in ["XLK", "XLY", "XLF", "XLI", "XLV", "XLP", "XLE", "XLB", "XLU"]:
+            col = f"{t}_ret_1d"
+            if col in df.columns:
+                rs_col = f"{t.lower()}_rel_spy_ret_1d"
+                rs = df[col].astype(float) - spy_ret
+                _add_col(rs_col, rs)
+                _add_col(f"{t.lower()}_rel_spy_ret_5", rs.rolling(5).mean().shift(1))
+                _add_col(f"{t.lower()}_rotation_speed_5", rs.diff(5).shift(1))
+
+    # 6) Explicit lead-lag return features for key assets (priority list).
+    lead_lag_tickers = ["SPY", "XLK", "MSFT", "GOOG", "NVDA"]
+    for t in lead_lag_tickers:
+        col = f"{t}_ret_1d"
+        if col not in df.columns:
+            continue
+        ret_t = df[col].astype(float)
+        for lag in (1, 3, 5):
+            _add_col(f"{t.lower()}_ret_1d_lag{lag}", ret_t.shift(lag))
+
+    # 7) Volatility change/regime features for key assets.
+    for t in lead_lag_tickers:
+        col = f"{t}_ret_1d"
+        if col not in df.columns:
+            continue
+        ret_t = df[col].astype(float)
+        vol20 = ret_t.rolling(20).std()
+        vol60 = ret_t.rolling(60).std()
+        _add_col(f"{t.lower()}_vol20", vol20)
+        _add_col(f"{t.lower()}_vol60", vol60)
+        _add_col(f"{t.lower()}_vol20_chg_5", vol20.diff(5).shift(1))
+        _add_col(f"{t.lower()}_vol20_over_vol60", (vol20 / (vol60 + 1e-12)).shift(1))
+
+    # 8) Volume anomaly lag/changes for key assets with volume information.
+    for t in lead_lag_tickers:
+        z_col = f"{t}_volume_z_20"
+        if z_col not in df.columns:
+            continue
+        vz = df[z_col].astype(float)
+        _add_col(f"{t.lower()}_volume_z_20_lag1", vz.shift(1))
+        _add_col(f"{t.lower()}_volume_z_20_lag3", vz.shift(3))
+        _add_col(f"{t.lower()}_volume_z_20_chg_1", vz.diff(1).shift(1))
+        _add_col(f"{t.lower()}_volume_z_20_chg_5", vz.diff(5).shift(1))
+
+    return df, added_cols
+
+
+def expand_with_other_stock_features(
+    base_features_df: pd.DataFrame,
+    data_dir: str | Path,
+    exclude_stocks: set[str] | None = None,
+    add_stock_technical_features: bool = True,
+    add_cross_asset_features: bool = True,
+    drop_high_nan_features: bool = False,
+    nan_drop_threshold: float = 0.40,
+    other_join: str = "inner",
+    final_join: str = "left",
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Expand a base feature table with prefixed features from other stocks.
+
+    Parameters
+    ----------
+    base_features_df:
+        The existing feature table to expand (e.g., AAPL_data_expand), indexed by datetime.
+    data_dir:
+        Directory containing stock CSV files with a 'Dt' column.
+    exclude_stocks:
+        Tickers to skip when building the other-stock feature table.
+    add_stock_technical_features:
+        If True, run add_technical_features for each other stock before prefixing.
+    add_cross_asset_features:
+        If True, append cross-asset relational features (breadth/dispersion/relative strength/
+        spread momentum/rolling correlations) after joining other stock features.
+    drop_high_nan_features:
+        If True, drop columns with NaN ratio strictly greater than ``nan_drop_threshold``.
+    nan_drop_threshold:
+        Threshold for column-wise NaN ratio dropping, used only when
+        ``drop_high_nan_features=True``.
+    other_join:
+        Join mode across other-stock feature blocks. Typically 'inner' for strict date alignment.
+    final_join:
+        Join mode when attaching the other-stock table onto base_features_df. Typically 'left'.
+
+    Returns
+    -------
+    expanded_df, other_features_big_table, audit_info
+    """
+
+    if exclude_stocks is None:
+        exclude_stocks = set()
+
+    base = base_features_df.copy()
+    if "Dt" in base.columns:
+        base["Dt"] = pd.to_datetime(base["Dt"], format="%Y-%m-%d", errors="coerce")
+        base = base.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+    else:
+        base = base.sort_index().copy()
+        base.index = pd.to_datetime(base.index, errors="coerce")
+        base = base[base.index.notna()]
+
+    paths = sorted(Path(data_dir).glob("*.csv"))
+    use_paths = [p for p in paths if p.stem not in set(exclude_stocks)]
+
+    other_blocks = []
+    used_tickers = []
+
+    for path in use_paths:
+        ticker = path.stem
+        df = pd.read_csv(path)
+        if "Dt" not in df.columns:
+            continue
+
+        df["Dt"] = pd.to_datetime(df["Dt"], format="%Y-%m-%d", errors="coerce")
+        df = df.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+
+        feat_df = add_technical_features(df) if add_stock_technical_features else df
+        feat_df = feat_df.rename(columns={col: f"{ticker}_{col}" for col in feat_df.columns})
+
+        other_blocks.append(feat_df)
+        used_tickers.append(ticker)
+
+    if not other_blocks:
+        raise ValueError("No other stock feature blocks were created. Check data_dir/exclude_stocks.")
+
+    other_features_big_table = pd.concat(other_blocks, axis=1, join=other_join).sort_index()
+    expanded_df = base.join(other_features_big_table, how=final_join)
+
+    cross_asset_added_cols: list[str] = []
+    if add_cross_asset_features:
+        expanded_df, cross_asset_added_cols = add_cross_asset_relation_features(expanded_df)
+
+    dropped_high_nan_cols: list[str] = []
+    if drop_high_nan_features:
+        nan_ratio_all = expanded_df.isna().mean()
+        dropped_high_nan_cols = nan_ratio_all[nan_ratio_all > nan_drop_threshold].index.tolist()
+        if dropped_high_nan_cols:
+            expanded_df = expanded_df.drop(columns=dropped_high_nan_cols)
+
+    duplicated_cols = expanded_df.columns[expanded_df.columns.duplicated()].tolist()
+    nan_ratio_top20 = expanded_df.isna().mean().sort_values(ascending=False).head(20)
+
+    audit_info = {
+        "used_tickers": used_tickers,
+        "other_features_shape": other_features_big_table.shape,
+        "base_shape": base.shape,
+        "expanded_shape": expanded_df.shape,
+        "other_date_min": other_features_big_table.index.min(),
+        "other_date_max": other_features_big_table.index.max(),
+        "duplicated_columns": duplicated_cols,
+        "cross_asset_added_columns": cross_asset_added_cols,
+        "dropped_high_nan_columns": dropped_high_nan_cols,
+        "top_nan_ratio": nan_ratio_top20,
+    }
+
+    return expanded_df, other_features_big_table, audit_info
+
 
 
 def window_time_split(
@@ -484,5 +997,3 @@ def evaluate_keras_model_on_validation(
         "val_macro_f1": val_macro_f1,
         "y_val_pred": y_val_pred,
     }
-
-
