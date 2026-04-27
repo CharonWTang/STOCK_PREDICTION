@@ -734,6 +734,79 @@ def expand_with_other_stock_features(
     return expanded_df, other_features_big_table, audit_info
 
 
+def build_aapl_expanded_features(
+    aapl_data: pd.DataFrame,
+    data_dir: str | Path,
+    exclude_stocks: set[str] | None = None,
+    drop_high_nan_features: bool = True,
+    nan_drop_threshold: float = 0.40,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Build the current AAPL expanded feature table used in the notebook.
+
+    This collects the scattered notebook steps:
+    1) AAPL technical features
+    2) SPY rolling alpha/beta, SPY technical features, and AAPL excess returns
+    3) final market-feature pass
+    4) other-stock features plus cross-asset relation features
+
+    Interaction features are intentionally not included here.
+    """
+    data_dir = Path(data_dir)
+    spy_path = data_dir / "SPY.csv"
+
+    if exclude_stocks is None:
+        exclude_stocks = {"AAPL", "MA", "V", "FB", "XLRE"}
+
+    aapl_expand = add_technical_features(aapl_data)
+
+    aapl_expand = add_rolling_alpha_beta_from_ret1d(
+        stock_features_df=aapl_expand,
+        market_data=spy_path,
+        rolling_window=30,
+    )
+    aapl_expand = add_rolling_alpha_beta_from_ret1d(
+        stock_features_df=aapl_expand,
+        market_data=spy_path,
+        rolling_window=60,
+    )
+
+    if {"alpha_60", "alpha_30"}.issubset(aapl_expand.columns):
+        aapl_expand["alpha_60minus_30"] = aapl_expand["alpha_60"] - aapl_expand["alpha_30"]
+    if {"beta_60", "beta_30"}.issubset(aapl_expand.columns):
+        aapl_expand["beta_60minus_30"] = aapl_expand["beta_60"] - aapl_expand["beta_30"]
+
+    spy_raw = pd.read_csv(spy_path)
+    if "Dt" in spy_raw.columns:
+        spy_raw["Dt"] = pd.to_datetime(spy_raw["Dt"], format="%Y-%m-%d", errors="coerce")
+        spy_raw = spy_raw.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+
+    spy_features = build_market_features(spy_raw)
+    aapl_expand = aapl_expand.join(spy_features, how="left")
+
+    if {"ret_1d", "spy_ret_1d"}.issubset(aapl_expand.columns):
+        aapl_expand["aapl_excess_ret_1d"] = aapl_expand["ret_1d"] - aapl_expand["spy_ret_1d"]
+    if {"ret_ma_5", "spy_ret_ma_5"}.issubset(aapl_expand.columns):
+        aapl_expand["aapl_excess_ret_ma_5"] = aapl_expand["ret_ma_5"] - aapl_expand["spy_ret_ma_5"]
+    if {"ret_ma_20", "spy_ret_ma_20"}.issubset(aapl_expand.columns):
+        aapl_expand["aapl_excess_ret_ma_20"] = aapl_expand["ret_ma_20"] - aapl_expand["spy_ret_ma_20"]
+
+    aapl_expand = add_more_market_feature(aapl_expand, spy_path)
+
+    aapl_expand, other_features_big_table, other_feature_audit = expand_with_other_stock_features(
+        base_features_df=aapl_expand,
+        data_dir=data_dir,
+        exclude_stocks=exclude_stocks,
+        add_stock_technical_features=True,
+        add_cross_asset_features=True,
+        drop_high_nan_features=drop_high_nan_features,
+        nan_drop_threshold=nan_drop_threshold,
+        other_join="inner",
+        final_join="left",
+    )
+
+    return aapl_expand, other_features_big_table, other_feature_audit
+
+
 
 def window_time_split(
     data: pd.DataFrame,
