@@ -6,6 +6,39 @@ from pathlib import Path
 from itertools import combinations
 
 
+def set_global_determinism(seed: int = 42, deterministic_ops: bool = True) -> None:
+    """Seed Python, NumPy, Keras, and TensorFlow before building a model."""
+    import importlib
+    import os
+    import random
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    try:
+        tf = importlib.import_module("tensorflow")
+    except ImportError:
+        tf = None
+
+    if tf is not None:
+        if hasattr(tf.keras.utils, "set_random_seed"):
+            tf.keras.utils.set_random_seed(seed)
+        if deterministic_ops:
+            try:
+                tf.config.experimental.enable_op_determinism()
+            except Exception:
+                pass
+
+    try:
+        keras = importlib.import_module("keras")
+    except ImportError:
+        keras = None
+
+    if keras is not None and hasattr(keras.utils, "set_random_seed"):
+        keras.utils.set_random_seed(seed)
+
+
 def _parabolic_sar(high: pd.Series, low: pd.Series, af_step: float = 0.02, af_max: float = 0.2) -> pd.Series:
     """Compute a simple Parabolic SAR series."""
     n = len(high)
@@ -83,6 +116,54 @@ def _direction_3class_target(values) -> np.ndarray:
     array = array.astype(float)
     categorized = np.where(array > 0.01, 1, np.where(array < -0.01, -1, 0))
     return (categorized + 1).astype(int)
+
+
+def _direction_binary_target(values) -> np.ndarray:
+    """Map raw returns to {0, 1} = {Down, Up} using zero as the boundary."""
+    array = np.asarray(values)
+    unique_values = set(np.unique(array).tolist())
+
+    if np.issubdtype(array.dtype, np.integer) and unique_values.issubset({0, 1}):
+        return array.astype(int)
+
+    if unique_values.issubset({0, 1, 2}) and 2 in unique_values:
+        target = np.full(array.shape, -1, dtype=int)
+        target[array == 0] = 0
+        target[array == 2] = 1
+        return target
+
+    if unique_values.issubset({-1, 0, 1}):
+        target = np.full(array.shape, -1, dtype=int)
+        target[array == -1] = 0
+        target[array == 1] = 1
+        return target
+
+    array = array.astype(float)
+    return np.where(array > 0.0, 1, 0).astype(int)
+
+
+def _direction_binary_filtered_target(values, threshold: float = 0.01) -> np.ndarray:
+    """Map raw returns to {-1, 0, 1}; -1 is an ambiguous Flat sample to drop."""
+    array = np.asarray(values)
+    unique_values = set(np.unique(array).tolist())
+
+    if np.issubdtype(array.dtype, np.integer) and unique_values.issubset({0, 1}):
+        return array.astype(int)
+
+    if unique_values.issubset({0, 1, 2}) and 2 in unique_values:
+        target = np.full(array.shape, -1, dtype=int)
+        target[array == 0] = 0
+        target[array == 2] = 1
+        return target
+
+    if unique_values.issubset({-1, 0, 1}):
+        target = np.full(array.shape, -1, dtype=int)
+        target[array == -1] = 0
+        target[array == 1] = 1
+        return target
+
+    array = array.astype(float)
+    return np.where(array > threshold, 1, np.where(array < -threshold, 0, -1)).astype(int)
 
 
 def make_sparse_macro_f1_metric(num_classes: int = 3, name: str = "macro_f1"):
@@ -231,6 +312,34 @@ def add_technical_features(X_df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+def _apply_transformed_feature_mode(data: pd.DataFrame, add_transformed_features: int | bool) -> pd.DataFrame:
+    """Apply the feature flag used by split helpers.
+
+    0/False: keep original columns only.
+    1/True: keep original columns plus engineered technical features.
+    2: keep only engineered technical features.
+    """
+    if isinstance(add_transformed_features, bool):
+        mode = int(add_transformed_features)
+    else:
+        mode = int(add_transformed_features)
+
+    if mode == 0:
+        return data.sort_index().copy()
+    if mode not in {1, 2}:
+        raise ValueError("add_transformed_features must be one of {0, 1, 2} or a boolean")
+
+    original_cols = list(data.columns)
+    transformed = add_technical_features(data)
+    if mode == 1:
+        return transformed
+
+    engineered_cols = [col for col in transformed.columns if col not in original_cols]
+    if not engineered_cols:
+        raise ValueError("add_transformed_features=2 produced no engineered feature columns")
+    return transformed.loc[:, engineered_cols]
+
+
 def add_rolling_alpha_beta_from_ret1d(
     stock_features_df: pd.DataFrame,
     market_data: pd.DataFrame | str | Path,
@@ -361,9 +470,8 @@ def add_more_market_feature(
     for column_name in market_features.columns:
         _set_if_missing(stock, column_name, market_features[column_name])
 
-    stock_close_col = "Adj Close" if "Adj Close" in stock.columns else "Close" if "Close" in stock.columns else None
     market_close_col = "Adj Close" if "Adj Close" in market_raw.columns else "Close" if "Close" in market_raw.columns else None
-    if stock_close_col is None or market_close_col is None:
+    if market_close_col is None:
         return stock.replace([np.inf, -np.inf], np.nan)
 
     stock_ret = stock["ret_1d"].astype(float)
@@ -426,18 +534,20 @@ def add_more_market_feature(
         _set_if_missing(stock, "spy_bb_macd_pressure", stock["spy_bb_width"] * stock["spy_macd_hist"])
 
     # Relative strength factor.
-    price_pair = pd.concat(
-        [
-            stock[stock_close_col].astype(float).rename("stock_close"),
-            market_raw[market_close_col].astype(float).rename("market_close"),
-        ],
-        axis=1,
-        join="inner",
-    ).dropna()
-    price_ratio = np.log(price_pair["stock_close"] / price_pair["market_close"])
-    _set_if_missing(stock, "aapl_spy_log_price_ratio", price_ratio.reindex(stock.index))
-    _set_if_missing(stock, "aapl_spy_log_price_ratio_ma_20", price_ratio.rolling(20).mean().shift(1).reindex(stock.index))
-    _set_if_missing(stock, "aapl_spy_log_price_ratio_slope_20", (price_ratio - price_ratio.shift(20)).shift(1).reindex(stock.index))
+    stock_close_col = "Adj Close" if "Adj Close" in stock.columns else "Close" if "Close" in stock.columns else None
+    if stock_close_col is not None:
+        price_pair = pd.concat(
+            [
+                stock[stock_close_col].astype(float).rename("stock_close"),
+                market_raw[market_close_col].astype(float).rename("market_close"),
+            ],
+            axis=1,
+            join="inner",
+        ).dropna()
+        price_ratio = np.log(price_pair["stock_close"] / price_pair["market_close"])
+        _set_if_missing(stock, "aapl_spy_log_price_ratio", price_ratio.reindex(stock.index))
+        _set_if_missing(stock, "aapl_spy_log_price_ratio_ma_20", price_ratio.rolling(20).mean().shift(1).reindex(stock.index))
+        _set_if_missing(stock, "aapl_spy_log_price_ratio_slope_20", (price_ratio - price_ratio.shift(20)).shift(1).reindex(stock.index))
 
     # Simple market-state bucket.
     if {"spy_ret_ma_20", "spy_volatility_20"}.issubset(stock.columns):
@@ -458,6 +568,162 @@ def add_more_market_feature(
         _set_if_missing(stock, "aapl_excess_ret_ma_20", stock["ret_ma_20"] - stock["spy_ret_ma_20"])
 
     return stock.replace([np.inf, -np.inf], np.nan)
+
+
+def build_plus_sector_aapl_excess_and_volume_features(
+    aapl_data: pd.DataFrame,
+    data_dir: str | Path,
+    sector_tickers: list[str] | tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Build the selected feature baseline used after v6 feature testing.
+
+    The returned table corresponds to ``plus_sector_aapl_excess_and_volume``:
+    AAPL technical features, SPY market/excess features without alpha/beta,
+    extra non-alpha/beta SPY market features, and sector ETF features measured
+    directly against AAPL. Other individual company features are intentionally
+    excluded because they did not improve validation performance in the notebook.
+    """
+
+    data_dir = Path(data_dir)
+    spy_path = data_dir / "SPY.csv"
+    if sector_tickers is None:
+        sector_tickers = ("XLU", "XLP", "XLK", "XLI", "XLF", "XLE", "XLB", "XLV")
+
+    def _normalize_price_volume_table(frame: pd.DataFrame) -> pd.DataFrame:
+        normalized = frame.copy()
+        if "Dt" in normalized.columns:
+            normalized["Dt"] = pd.to_datetime(normalized["Dt"], format="%Y-%m-%d", errors="coerce")
+            normalized = normalized.dropna(subset=["Dt"]).sort_values("Dt").drop_duplicates(subset="Dt").set_index("Dt")
+        else:
+            normalized = normalized.sort_index().copy()
+            normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+            normalized = normalized[normalized.index.notna()]
+        return normalized
+
+    def _load_price_volume_table(ticker: str) -> pd.DataFrame:
+        path = data_dir / f"{ticker}.csv"
+        raw = pd.read_csv(path)
+        return _normalize_price_volume_table(raw)
+
+    def _rolling_volume_z(volume: pd.Series, window: int = 20) -> pd.Series:
+        volume = volume.astype(float)
+        return (volume - volume.rolling(window).mean()) / (volume.rolling(window).std() + 1e-12)
+
+    aapl_raw = _normalize_price_volume_table(aapl_data)
+    aapl_base_features = add_technical_features(aapl_raw)
+    aapl_raw_cols = [col for col in aapl_raw.columns if col in aapl_base_features.columns]
+    aapl_base_features = aapl_base_features.drop(columns=aapl_raw_cols)
+
+    spy_raw = _load_price_volume_table("SPY")
+    spy_features = build_market_features(spy_raw).reindex(aapl_base_features.index)
+
+    excess_features = pd.DataFrame(index=aapl_base_features.index)
+    excess_features["aapl_excess_ret_1d"] = aapl_base_features["ret_1d"] - spy_features["spy_ret_1d"]
+    excess_features["aapl_excess_ret_ma_5"] = aapl_base_features["ret_ma_5"] - spy_features["spy_ret_ma_5"]
+    excess_features["aapl_excess_ret_ma_20"] = aapl_base_features["ret_ma_20"] - spy_features["spy_ret_ma_20"]
+
+    no_alpha_beta_baseline = pd.concat(
+        [aapl_base_features, spy_features, excess_features],
+        axis=1,
+    )
+    no_alpha_beta_baseline = no_alpha_beta_baseline.loc[:, ~no_alpha_beta_baseline.columns.duplicated()]
+
+    extra_market_candidate = add_more_market_feature(no_alpha_beta_baseline.copy(), spy_path)
+    extra_market_cols = [
+        col for col in extra_market_candidate.columns
+        if col not in no_alpha_beta_baseline.columns
+        and col.startswith(("spy_", "aapl_spy_", "aapl_excess_"))
+        and not col.startswith(("alpha_", "beta_"))
+    ]
+    skipped_alpha_beta_cols = [
+        col for col in extra_market_candidate.columns
+        if col not in no_alpha_beta_baseline.columns
+        and col.startswith(("alpha_", "beta_"))
+    ]
+    extra_market_features = extra_market_candidate.loc[:, extra_market_cols]
+
+    extra_market_baseline = pd.concat(
+        [no_alpha_beta_baseline, extra_market_features],
+        axis=1,
+    )
+    extra_market_baseline = extra_market_baseline.loc[:, ~extra_market_baseline.columns.duplicated()]
+
+    aapl_features_for_sector = add_technical_features(aapl_raw)
+    aapl_ret_1d = aapl_features_for_sector["ret_1d"]
+    aapl_ret_ma_5 = aapl_features_for_sector["ret_ma_5"]
+    aapl_ret_ma_20 = aapl_features_for_sector["ret_ma_20"]
+    aapl_volume = aapl_raw["Volume"].astype(float)
+    aapl_volume_chg_1d = aapl_volume.pct_change()
+    aapl_volume_z_20 = _rolling_volume_z(aapl_volume, window=20)
+    aapl_volume_ma_20 = aapl_volume.rolling(20).mean()
+
+    sector_blocks = []
+    sector_summary = []
+    for ticker in sector_tickers:
+        sector_raw = _load_price_volume_table(ticker)
+        sector_features = add_technical_features(sector_raw)
+        sector_volume = sector_raw["Volume"].astype(float)
+
+        block = pd.DataFrame(index=extra_market_baseline.index)
+
+        sector_excess_ret_1d = aapl_ret_1d - sector_features["ret_1d"]
+        sector_excess_ret_ma_5 = aapl_ret_ma_5 - sector_features["ret_ma_5"]
+        sector_excess_ret_ma_20 = aapl_ret_ma_20 - sector_features["ret_ma_20"]
+        block[f"AAPL_{ticker}_excess_ret_1d"] = sector_excess_ret_1d.reindex(block.index)
+        block[f"AAPL_{ticker}_excess_ret_ma_5"] = sector_excess_ret_ma_5.reindex(block.index)
+        block[f"AAPL_{ticker}_excess_ret_ma_20"] = sector_excess_ret_ma_20.reindex(block.index)
+        block[f"AAPL_{ticker}_excess_ret_mom_5_20"] = (sector_excess_ret_ma_5 - sector_excess_ret_ma_20).reindex(block.index)
+
+        sector_volume_chg_1d = sector_volume.pct_change()
+        sector_volume_z_20 = _rolling_volume_z(sector_volume, window=20)
+        sector_volume_ma_20 = sector_volume.rolling(20).mean()
+        block[f"{ticker}_AAPL_volume_chg_excess_1d"] = (sector_volume_chg_1d - aapl_volume_chg_1d).reindex(block.index)
+        block[f"{ticker}_AAPL_volume_z_20_spread"] = (sector_volume_z_20 - aapl_volume_z_20).reindex(block.index)
+        block[f"{ticker}_AAPL_volume_ratio_20"] = ((sector_volume_ma_20 / (aapl_volume_ma_20 + 1e-12)) - 1.0).reindex(block.index)
+
+        sector_has_data = sector_raw.notna().any(axis=1)
+        sector_first_available = sector_has_data[sector_has_data].index.min() if sector_has_data.any() else pd.NaT
+
+        sector_blocks.append(block)
+        sector_summary.append({
+            "ticker": ticker,
+            "first_available_date": sector_first_available,
+            "last_date": sector_raw.index.max(),
+            "features_added": block.shape[1],
+        })
+
+    sector_features = pd.concat(sector_blocks, axis=1).replace([np.inf, -np.inf], np.nan)
+
+    selected_features = pd.concat(
+        [extra_market_baseline, sector_features],
+        axis=1,
+    )
+    selected_features = selected_features.loc[:, ~selected_features.columns.duplicated()]
+    selected_features = selected_features.replace([np.inf, -np.inf], np.nan)
+
+    audit = {
+        "feature_set_name": "plus_sector_aapl_excess_and_volume",
+        "aapl_raw_columns_dropped": aapl_raw_cols,
+        "aapl_base_shape": aapl_base_features.shape,
+        "spy_feature_shape": spy_features.shape,
+        "excess_feature_shape": excess_features.shape,
+        "no_alpha_beta_baseline_shape": no_alpha_beta_baseline.shape,
+        "extra_market_columns": extra_market_cols,
+        "extra_market_shape": extra_market_features.shape,
+        "skipped_alpha_beta_columns": skipped_alpha_beta_cols,
+        "extra_market_baseline_shape": extra_market_baseline.shape,
+        "sector_tickers": list(sector_tickers),
+        "sector_feature_columns": sector_features.columns.tolist(),
+        "sector_feature_shape": sector_features.shape,
+        "sector_summary": pd.DataFrame(sector_summary),
+        "final_shape": selected_features.shape,
+        "alpha_beta_columns_in_final": [
+            col for col in selected_features.columns
+            if col.startswith(("alpha_", "beta_"))
+        ],
+    }
+
+    return selected_features, audit
 
 
 def add_interaction_features(
@@ -527,11 +793,12 @@ def add_cross_asset_relation_features(expanded_df: pd.DataFrame) -> tuple[pd.Dat
     symbols generated by ``expand_with_other_stock_features``.
     """
     df = expanded_df.copy()
+    new_columns: dict[str, pd.Series] = {}
     added_cols: list[str] = []
 
     def _add_col(name: str, series: pd.Series) -> None:
-        if name not in df.columns:
-            df[name] = series
+        if name not in df.columns and name not in new_columns:
+            new_columns[name] = series
             added_cols.append(name)
 
     if "ret_1d" not in df.columns:
@@ -620,6 +887,9 @@ def add_cross_asset_relation_features(expanded_df: pd.DataFrame) -> tuple[pd.Dat
         _add_col(f"{t.lower()}_volume_z_20_lag3", vz.shift(3))
         _add_col(f"{t.lower()}_volume_z_20_chg_1", vz.diff(1).shift(1))
         _add_col(f"{t.lower()}_volume_z_20_chg_5", vz.diff(5).shift(1))
+
+    if new_columns:
+        df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1).copy()
 
     return df, added_cols
 
@@ -817,14 +1087,24 @@ def window_time_split(
     window_size: int = 252,
     target_mode: str = "raw",
     return_index: bool = False,
+    return_raw_target: bool = False,
 ):
     """Align data/target, then build rolling windows and split in time order."""
     if not np.isclose(train_size + val_size + test_size, 1.0):
         raise ValueError("train_size + val_size + test_size must equal 1.0")
 
     target_mode = target_mode.lower().strip()
-    if target_mode not in {"raw", "direction_3class", "direction3", "categorical"}:
-        raise ValueError("target_mode must be one of {'raw', 'direction_3class', 'direction3', 'categorical'}")
+    three_class_modes = {"direction_3class", "direction3", "categorical"}
+    binary_modes = {"direction_binary", "direction_2class", "direction2", "binary"}
+    zero_binary_modes = {"direction_binary_zero", "direction_2class_zero", "binary_zero"}
+    filtered_binary_modes = {"direction_binary_filtered", "direction_2class_filtered", "binary_filtered"}
+    if target_mode not in {"raw"} | three_class_modes | binary_modes | zero_binary_modes | filtered_binary_modes:
+        raise ValueError(
+            "target_mode must be one of {'raw', 'direction_3class', 'direction3', "
+            "'categorical', 'direction_binary', 'direction_2class', 'direction2', 'binary', "
+            "'direction_binary_zero', 'direction_2class_zero', 'binary_zero', "
+            "'direction_binary_filtered', 'direction_2class_filtered', 'binary_filtered'}"
+        )
 
     data = data.sort_index().copy()
     target = target.sort_index().copy()
@@ -841,11 +1121,28 @@ def window_time_split(
     if len(data) != len(target):
         raise ValueError("data and target could not be aligned to the same length")
 
-    if target_mode != "raw":
+    raw_target = target.copy()
+    train_filtered_binary = target_mode in binary_modes
+    drop_all_binary = target_mode in filtered_binary_modes
+    binary_target = target_mode in binary_modes | zero_binary_modes | filtered_binary_modes
+    binary_filter_target = None
+    if target_mode in three_class_modes:
         target = pd.Series(_direction_3class_target(target.to_numpy()), index=target.index, name=target.name)
+    elif target_mode in binary_modes | zero_binary_modes:
+        target = pd.Series(_direction_binary_target(target.to_numpy()), index=target.index, name=target.name)
+        if train_filtered_binary:
+            binary_filter_target = pd.Series(
+                _direction_binary_filtered_target(raw_target.to_numpy()),
+                index=target.index,
+                name=target.name,
+            )
+    elif target_mode in filtered_binary_modes:
+        target = pd.Series(_direction_binary_filtered_target(target.to_numpy()), index=target.index, name=target.name)
 
     X_raw = data.to_numpy()
     y_raw = target.to_numpy()
+    raw_y_raw = raw_target.to_numpy()
+    filter_y_raw = binary_filter_target.to_numpy() if binary_filter_target is not None else None
     idx_raw = data.index.to_numpy()
 
     n = len(data)
@@ -853,14 +1150,19 @@ def window_time_split(
         raise ValueError(f"Not enough rows ({n}) for window_size={window_size}")
 
     # 1) Window first
-    X_list, y_list, t_list = [], [], []
+    X_list, y_list, raw_y_list, filter_y_list, t_list = [], [], [], [], []
     for t in range(window_size, n):
         X_list.append(X_raw[t - window_size:t])  # past window
         y_list.append(y_raw[t])                  # predict current time t
+        raw_y_list.append(raw_y_raw[t])          # original target value before label conversion
+        if filter_y_raw is not None:
+            filter_y_list.append(filter_y_raw[t])
         t_list.append(idx_raw[t])                # timestamp of label
 
     X = np.asarray(X_list)
     y = np.asarray(y_list)
+    raw_y = np.asarray(raw_y_list)
+    filter_y = np.asarray(filter_y_list) if filter_y_raw is not None else None
     t_idx = np.asarray(t_list)
 
     # 2) Split by time order
@@ -874,12 +1176,65 @@ def window_time_split(
     x_train, y_train = X[:train_end], y[:train_end]
     x_val, y_val = X[train_end:val_end], y[train_end:val_end]
     x_test, y_test = X[val_end:], y[val_end:]
+    raw_y_train, raw_y_val = raw_y[:train_end], raw_y[train_end:val_end]
+    raw_y_test = raw_y[val_end:]
+    if filter_y is not None:
+        filter_y_train = filter_y[:train_end]
+        filter_y_val = filter_y[train_end:val_end]
+        filter_y_test = filter_y[val_end:]
 
     if return_index:
         idx_train = t_idx[:train_end]
         idx_val = t_idx[train_end:val_end]
         idx_test = t_idx[val_end:]
+
+        if train_filtered_binary or drop_all_binary:
+            if train_filtered_binary:
+                train_mask = filter_y_train != -1
+                val_mask = np.ones(len(y_val), dtype=bool)
+                test_mask = np.ones(len(y_test), dtype=bool)
+            else:
+                train_mask = y_train != -1
+                val_mask = y_val != -1
+                test_mask = y_test != -1
+            x_train, y_train, idx_train = x_train[train_mask], y_train[train_mask].astype(int), idx_train[train_mask]
+            x_val, y_val, idx_val = x_val[val_mask], y_val[val_mask].astype(int), idx_val[val_mask]
+            x_test, y_test, idx_test = x_test[test_mask], y_test[test_mask].astype(int), idx_test[test_mask]
+            raw_y_train, raw_y_val, raw_y_test = raw_y_train[train_mask], raw_y_val[val_mask], raw_y_test[test_mask]
+            if min(len(y_train), len(y_val), len(y_test)) == 0:
+                raise ValueError(f"{target_mode} produced an empty train, validation, or test split")
+        elif binary_target:
+            y_train, y_val, y_test = y_train.astype(int), y_val.astype(int), y_test.astype(int)
+
+        if return_raw_target:
+            return (
+                x_train, y_train, x_val, y_val, x_test, y_test,
+                idx_train, idx_val, idx_test,
+                raw_y_train, raw_y_val, raw_y_test,
+            )
+
         return x_train, y_train, x_val, y_val, x_test, y_test, idx_train, idx_val, idx_test
+
+    if train_filtered_binary or drop_all_binary:
+        if train_filtered_binary:
+            train_mask = filter_y_train != -1
+            val_mask = np.ones(len(y_val), dtype=bool)
+            test_mask = np.ones(len(y_test), dtype=bool)
+        else:
+            train_mask = y_train != -1
+            val_mask = y_val != -1
+            test_mask = y_test != -1
+        x_train, y_train = x_train[train_mask], y_train[train_mask].astype(int)
+        x_val, y_val = x_val[val_mask], y_val[val_mask].astype(int)
+        x_test, y_test = x_test[test_mask], y_test[test_mask].astype(int)
+        raw_y_train, raw_y_val, raw_y_test = raw_y_train[train_mask], raw_y_val[val_mask], raw_y_test[test_mask]
+        if min(len(y_train), len(y_val), len(y_test)) == 0:
+            raise ValueError(f"{target_mode} produced an empty train, validation, or test split")
+    elif binary_target:
+        y_train, y_val, y_test = y_train.astype(int), y_val.astype(int), y_test.astype(int)
+
+    if return_raw_target:
+        return x_train, y_train, x_val, y_val, x_test, y_test, raw_y_train, raw_y_val, raw_y_test
 
     return x_train, y_train, x_val, y_val, x_test, y_test
 
@@ -893,6 +1248,7 @@ def single_stock_split(
     add_transformed_features: int | bool = 1,
     target_mode: str = "raw",
     return_index: bool = False,
+    return_raw_target: bool = False,
 ):
     """
     Build sliding windows first, then split by time order.
@@ -900,15 +1256,11 @@ def single_stock_split(
     y_series: target series, indexed by time
 
     add_transformed_features:
-    - 0/False: no transformed features
-    - non-zero/True: add transformed features and keep all original columns
+    - 0/False: keep original features only
+    - 1/True: add transformed features and keep all original columns
+    - 2: keep only transformed features
     """
-    data = X_df.sort_index().copy()
-
-    # Keep compatibility with old int flags: 0/False means no add, any non-zero means add.
-    add_flag = bool(add_transformed_features)
-    if add_flag:
-        data = add_technical_features(data)
+    data = _apply_transformed_feature_mode(X_df.sort_index().copy(), add_transformed_features)
 
     return window_time_split(
         data=data,
@@ -919,6 +1271,7 @@ def single_stock_split(
         window_size=window_size,
         target_mode=target_mode,
         return_index=return_index,
+        return_raw_target=return_raw_target,
     )
 
 
@@ -933,6 +1286,7 @@ def multi_stock_split(
     add_transformed_features: int | bool = 1,
     target_mode: str = "raw",
     return_index: bool = False,
+    return_raw_target: bool = False,
 ):
     """
     Build multi-stock features by:
@@ -950,15 +1304,11 @@ def multi_stock_split(
         Other stock wide table containing time-aligned features. It can be indexed by time or
         include a 'Dt' column.
     add_transformed_features:
-        - 0/False: no transformed features on main stock
-        - non-zero/True: add transformed features and keep all raw columns
+        - 0/False: keep original main-stock features only
+        - 1/True: add transformed main-stock features and keep all original columns
+        - 2: keep only transformed main-stock features
     """
-    data = X_df.sort_index().copy()
-
-    # Keep compatibility with old int flags: 0/False means no add, any non-zero means add.
-    add_flag = bool(add_transformed_features)
-    if add_flag:
-        data = add_technical_features(data)
+    data = _apply_transformed_feature_mode(X_df.sort_index().copy(), add_transformed_features)
 
     # Normalize time index for other stock table
     other = other_stocks_df.copy()
@@ -994,6 +1344,7 @@ def multi_stock_split(
         window_size=window_size,
         target_mode=target_mode,
         return_index=return_index,
+        return_raw_target=return_raw_target,
     )
 
 
@@ -1003,7 +1354,13 @@ def evaluate_keras_model_on_validation(
     x_val: np.ndarray,
     y_val_cat: np.ndarray,
     prefix: str = "model",
-    class_names: tuple[str, str, str] = ("Down", "Flat", "Up"),
+    class_names: tuple[str, ...] | None = None,
+    raw_return: np.ndarray | pd.Series | None = None,
+    benchmark_return: np.ndarray | pd.Series | None = None,
+    benchmark_name: str | None = None,
+    down_position: float = -1.0,
+    flat_position: float = 0.0,
+    up_position: float = 1.0,
     plot_history: bool = True,
 ):
     """Evaluate a trained Keras classification model on a validation set."""
@@ -1014,14 +1371,31 @@ def evaluate_keras_model_on_validation(
     metrics = importlib.import_module("sklearn.metrics")
     plt = importlib.import_module("matplotlib.pyplot")
 
+    num_classes = int(model.output_shape[-1])
+    if class_names is None or len(class_names) != num_classes:
+        class_names = ("Down", "Up") if num_classes == 2 else ("Down", "Flat", "Up")
+    labels = list(range(num_classes))
+
     y_val_rnn = np.asarray(y_val_cat)
     unique_values = set(np.unique(y_val_rnn).tolist())
-    if unique_values.issubset({0, 1, 2}):
-        y_val_rnn = y_val_rnn.astype(int)
-    elif unique_values.issubset({-1, 0, 1}):
-        y_val_rnn = y_val_rnn.astype(int) + 1
+    sample_mask = None
+
+    if num_classes == 2:
+        if np.issubdtype(y_val_rnn.dtype, np.integer) and unique_values.issubset({0, 1}):
+            y_val_rnn = y_val_rnn.astype(int)
+        else:
+            y_val_rnn = _direction_binary_target(y_val_rnn)
+            keep_mask = y_val_rnn != -1
+            sample_mask = keep_mask
+            x_val = x_val[keep_mask]
+            y_val_rnn = y_val_rnn[keep_mask].astype(int)
     else:
-        y_val_rnn = _direction_3class_target(y_val_rnn)
+        if unique_values.issubset({0, 1, 2}):
+            y_val_rnn = y_val_rnn.astype(int)
+        elif unique_values.issubset({-1, 0, 1}):
+            y_val_rnn = y_val_rnn.astype(int) + 1
+        else:
+            y_val_rnn = _direction_3class_target(y_val_rnn)
 
     eval_results = model.evaluate(x_val, y_val_rnn, verbose=0, return_dict=True)
     val_loss = float(eval_results["loss"])
@@ -1034,12 +1408,77 @@ def evaluate_keras_model_on_validation(
     print(metrics.classification_report(
         y_val_rnn,
         y_val_pred,
-        labels=[0, 1, 2],
+        labels=labels,
         target_names=list(class_names),
         zero_division=0,
     ))
     print(f"\n[{prefix}] Validation confusion matrix:")
-    print(metrics.confusion_matrix(y_val_rnn, y_val_pred, labels=[0, 1, 2]))
+    print(metrics.confusion_matrix(y_val_rnn, y_val_pred, labels=labels))
+
+    trading_results = {}
+    if raw_return is not None:
+        raw_return_arr = np.asarray(raw_return, dtype=float).reshape(-1)
+        if sample_mask is not None and len(raw_return_arr) == len(sample_mask):
+            raw_return_arr = raw_return_arr[sample_mask]
+        if len(raw_return_arr) != len(y_val_pred):
+            raise ValueError(
+                f"raw_return length ({len(raw_return_arr)}) must match validation predictions ({len(y_val_pred)})."
+            )
+
+        if num_classes == 2:
+            position = np.where(y_val_pred == 1, up_position, down_position)
+        elif num_classes == 3:
+            position = np.where(
+                y_val_pred == 2,
+                up_position,
+                np.where(y_val_pred == 0, down_position, flat_position),
+            )
+        else:
+            raise ValueError("Trading evaluation supports only 2-class or 3-class outputs.")
+
+        strategy_return = position * raw_return_arr
+        if benchmark_return is None:
+            benchmark_arr = raw_return_arr
+            benchmark_label = benchmark_name or "buy-and-hold"
+        else:
+            benchmark_arr = np.asarray(benchmark_return, dtype=float).reshape(-1)
+            if sample_mask is not None and len(benchmark_arr) == len(sample_mask):
+                benchmark_arr = benchmark_arr[sample_mask]
+            if len(benchmark_arr) != len(y_val_pred):
+                raise ValueError(
+                    f"benchmark_return length ({len(benchmark_arr)}) must match validation predictions ({len(y_val_pred)})."
+                )
+            benchmark_label = benchmark_name or "benchmark"
+
+        excess_return = strategy_return - benchmark_arr
+        strategy_average_return = float(np.mean(strategy_return))
+        benchmark_average_return = float(np.mean(benchmark_arr))
+        excess_average_return = float(np.mean(excess_return))
+        strategy_annualized_return = strategy_average_return * 252.0
+        benchmark_annualized_return = benchmark_average_return * 252.0
+        excess_annualized_return = excess_average_return * 252.0
+
+        print(f"\n[{prefix}] Validation trading performance:")
+        print(f"[{prefix}] Strategy average return: {strategy_average_return:.6%}")
+        print(f"[{prefix}] {benchmark_label} average return: {benchmark_average_return:.6%}")
+        print(f"[{prefix}] Excess average return: {excess_average_return:.6%}")
+        print(f"[{prefix}] Strategy annualized arithmetic return: {strategy_annualized_return:.4%}")
+        print(f"[{prefix}] {benchmark_label} annualized arithmetic return: {benchmark_annualized_return:.4%}")
+        print(f"[{prefix}] Excess annualized arithmetic return: {excess_annualized_return:.4%}")
+
+        trading_results = {
+            "position": position,
+            "strategy_return": strategy_return,
+            "benchmark_return": benchmark_arr,
+            "excess_return": excess_return,
+            "strategy_average_return": strategy_average_return,
+            "benchmark_average_return": benchmark_average_return,
+            "excess_average_return": excess_average_return,
+            "strategy_annualized_return": strategy_annualized_return,
+            "benchmark_annualized_return": benchmark_annualized_return,
+            "excess_annualized_return": excess_annualized_return,
+            "mean_excess_return": excess_average_return,
+        }
 
     if plot_history and history is not None:
         metric_key = "macro_f1" if "macro_f1" in history.history else "accuracy"
@@ -1065,8 +1504,10 @@ def evaluate_keras_model_on_validation(
         plt.tight_layout()
         plt.show()
 
-    return {
+    results = {
         "val_loss": val_loss,
         "val_macro_f1": val_macro_f1,
         "y_val_pred": y_val_pred,
     }
+    results.update(trading_results)
+    return results
